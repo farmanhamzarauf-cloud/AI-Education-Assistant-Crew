@@ -1,4 +1,53 @@
 import os
+import inspect
+import litellm  # import BEFORE crewai so our patch is in place first
+
+# ---------------------------------------------------------------------------
+# Groq fix: CrewAI adds a "cache_breakpoint" field to messages (used for prompt
+# caching on other providers). Groq rejects it, so we remove it before sending.
+# ---------------------------------------------------------------------------
+_UNSUPPORTED_KEYS = {"cache_breakpoint", "cache_control"}
+
+
+def _clean(obj):
+    """Recursively remove unsupported keys from messages."""
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items() if k not in _UNSUPPORTED_KEYS}
+    if isinstance(obj, list):
+        return [_clean(item) for item in obj]
+    return obj
+
+
+def _clean_call(args, kwargs):
+    args = list(args)
+    if len(args) > 1:                       # litellm.completion(model, messages, ...)
+        args[1] = _clean(args[1])
+    if kwargs.get("messages"):
+        kwargs["messages"] = _clean(kwargs["messages"])
+    return tuple(args), kwargs
+
+
+def _wrap(fn):
+    if inspect.iscoroutinefunction(fn):
+        async def async_wrapper(*args, **kwargs):
+            args, kwargs = _clean_call(args, kwargs)
+            return await fn(*args, **kwargs)
+        async_wrapper._cleaned = True
+        return async_wrapper
+
+    def wrapper(*args, **kwargs):
+        args, kwargs = _clean_call(args, kwargs)
+        return fn(*args, **kwargs)
+    wrapper._cleaned = True
+    return wrapper
+
+
+for _name in ("completion", "acompletion"):
+    _fn = getattr(litellm, _name, None)
+    if _fn is not None and not getattr(_fn, "_cleaned", False):
+        setattr(litellm, _name, _wrap(_fn))
+# ---------------------------------------------------------------------------
+
 from crewai import Agent, Task, Crew, LLM, Process
 from crewai.tools import tool
 from ddgs import DDGS
